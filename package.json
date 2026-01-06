@@ -37,11 +37,14 @@
     }
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.0",
+    "express": "^5.1.0",
     "playwright": "1.58.0-alpha-2025-12-29",
     "playwright-core": "1.58.0-alpha-2025-12-29"
   },
   "bin": {
-    "mcp-server-playwright": "cli.js"
+    "mcp-server-playwright": "cli.js",
+    "mcp-server-playwright-multi-tab": "custom-cli.js"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.24.0",
