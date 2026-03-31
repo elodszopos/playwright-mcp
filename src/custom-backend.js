@@ -24,7 +24,7 @@ const { SessionLog } = require(path.join(mcpPath, 'browser', 'sessionLog'));
 const { toMcpTool } = require(path.join(mcpPath, 'sdk', 'tool'));
 const { Response: OriginalResponse } = require(path.join(mcpPath, 'browser', 'response'));
 
-const snapshotCache = require('./snapshot-cache');
+const snapshotCache = require('./snapshot-cache-enhanced');
 const recordingManager = require('./recording-manager');
 const { createRecordingTools } = require('./recording-tools');
 const outputCache = require('./output-cache');

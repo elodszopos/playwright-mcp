@@ -9,7 +9,7 @@ A Model Context Protocol (MCP) server that provides browser automation capabilit
 | Feature | Description |
 |---------|-------------|
 | **Tab Isolation** | Multi-agent browser access - each agent works on its own tab |
-| **Snapshot Caching** | Auto-cache large snapshots (>300 lines) to prevent token overflow |
+| **Snapshot Caching** | Dual-layer cache: in-memory + disk persistence with organized storage by search context |
 | **Output Caching** | Auto-cache any large output (console, network, etc. >100 lines) |
 | **Recording System** | Record and analyze UI state changes over time for debugging |
 
@@ -102,14 +102,23 @@ The tab isolation system correctly handles when users manually open/close tabs i
 
 ## 📦 Snapshot Caching
 
+**Enhanced with dual-layer architecture**: In-memory cache + organized disk persistence.
+
 When `browser_snapshot` returns more than **300 lines**, instead of consuming excessive tokens:
 
-1. The snapshot is cached with a unique ID
-2. A summary is returned with:
+1. The snapshot is **cached in memory** with a unique ID (fast agent access)
+2. The snapshot is **saved to disk** in organized folders (cross-session recovery)
+3. A summary is returned with:
    - Page URL & title
    - Total lines count
    - Cache ID for retrieval
    - Structure hints (main elements, interactive refs)
+
+**Disk Organization**: Snapshots are saved to `~/Downloads/rejust-searches/[search-context]/[case-id]-part-N.json`
+
+**CLI Flag**: Use `--search-context <name>` to set the folder name for organized storage.
+
+📚 **See [SNAPSHOT-CACHE.md](./docs/SNAPSHOT-CACHE.md) for complete documentation and [QUICKSTART-CACHE.md](./docs/QUICKSTART-CACHE.md) for quick setup.**
 
 ### Cache Navigation Tools
 
@@ -143,9 +152,12 @@ search_cached_snapshot { "cacheId": "abc123", "query": "button", "maxResults": 1
 | Setting | Value |
 |---------|-------|
 | Threshold | 300 lines |
-| Max cache size | 50 snapshots |
-| Cache expiry | 30 minutes |
+| Max in-memory cache size | 50 snapshots |
+| Cache expiry (memory) | 30 minutes |
+| Disk persistence | Enabled (saved to ~/Downloads/rejust-searches/) |
+| Split threshold | 1000 lines per JSON file |
 | Default page size | 100 lines |
+| Search context | Set via `--search-context` CLI flag |
 
 ---
 

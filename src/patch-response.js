@@ -4,7 +4,7 @@
  */
 
 const path = require('path');
-const snapshotCache = require('./snapshot-cache');
+const snapshotCache = require('./snapshot-cache-enhanced');
 
 // Get the original response module
 const originalResponsePath = require.resolve('playwright/lib/mcp/browser/response');
