@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
- * Custom Playwright MCP CLI with snapshot caching and recording
+ * Custom Playwright MCP CLI with snapshot caching, recording, and multi-session support.
+ *
+ * Architecture:
+ *   Stdio mode  — one SharedBrowserCore, one SessionBrowserBackend, one MCP Server
+ *   SSE mode    — one SharedBrowserCore, N SessionBrowserBackends (one per SSE client),
+ *                 N MCP Servers. All sessions share one browser; tab isolation via registry.
  */
 
 const path = require('path');
 
-// Direct paths to playwright internals
 const playwrightCorePath = path.dirname(require.resolve('playwright-core/package.json'));
 const playwrightPath = path.dirname(require.resolve('playwright/package.json'));
 const mcpPath = path.join(playwrightPath, 'lib', 'mcp');
@@ -17,22 +21,10 @@ const mcpServer = require(path.join(mcpPath, 'sdk', 'server'));
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
 const http = require('http');
-const { CustomBrowserServerBackend } = require('./src/custom-backend');
+const { SharedBrowserCore, SessionBrowserBackend } = require('./src/custom-backend');
 
 const packageJSON = require('./package.json');
 
-async function createCustomConnection(userConfig = {}) {
-  const config = await resolveConfig(userConfig);
-  const factory = contextFactory(config);
-  return mcpServer.createServer(
-    'Playwright-Custom',
-    packageJSON.version,
-    new CustomBrowserServerBackend(config, factory),
-    false
-  );
-}
-
-// CLI setup
 program
   .version('Version ' + packageJSON.version)
   .name('Playwright MCP Custom')
@@ -45,15 +37,12 @@ program
   .option('--max-snapshot-lines <lines>', 'Max lines before caching (default: 300)', '300')
   .option('--search-context <name>', 'Search context folder name for organized cache storage')
   .action(async (options) => {
-    // Use enhanced cache with disk persistence
     const cache = require('./src/snapshot-cache-enhanced');
 
-    // Update cache config if provided
     if (options.maxSnapshotLines) {
       cache.CONFIG.maxLines = parseInt(options.maxSnapshotLines, 10);
     }
 
-    // Set search context if provided
     if (options.searchContext) {
       cache.setSearchContext(options.searchContext);
       console.error(`[MCP] Search context: ${cache.getSearchContext()}`);
@@ -65,10 +54,11 @@ program
     if (options.headless) config.browser = { ...config.browser, headless: true };
     if (options.vision) config.vision = true;
 
+    const resolvedConfig = await resolveConfig(config);
+    const factory = contextFactory(resolvedConfig);
+    const sharedCore = new SharedBrowserCore(resolvedConfig, factory);
+
     if (options.port) {
-      // SSE transport — one MCP Server per SSE client.
-      // Each client gets its own Server + Backend + Context to avoid lifecycle
-      // conflicts (old client disconnect would dispose the current client's browser).
       const port = parseInt(options.port, 10);
       const host = options.host || 'localhost';
       const sessions = new Map();
@@ -77,15 +67,31 @@ program
         const url = new URL(req.url, `http://${host}`);
 
         if (req.method === 'GET' && url.pathname === '/sse') {
-          const connection = await createCustomConnection(config);
           const transport = new SSEServerTransport('/messages', res);
-          sessions.set(transport.sessionId, { transport, connection });
-          console.error(`[MCP] SSE client connected: ${transport.sessionId} (total: ${sessions.size})`);
+          const sessionId = transport.sessionId;
+
+          const backend = new SessionBrowserBackend(sessionId, sharedCore);
+          const connection = mcpServer.createServer(
+            'Playwright-Custom',
+            packageJSON.version,
+            backend,
+            false
+          );
+
+          sessions.set(sessionId, { transport, connection, backend });
+          console.error(`[MCP] SSE client connected: ${sessionId} (total: ${sessions.size})`);
+
           res.on('close', () => {
-            sessions.delete(transport.sessionId);
-            console.error(`[MCP] SSE client disconnected: ${transport.sessionId} (total: ${sessions.size})`);
+            const session = sessions.get(sessionId);
+            if (session) {
+              session.backend.serverClosed();
+              sessions.delete(sessionId);
+            }
+            console.error(`[MCP] SSE client disconnected: ${sessionId} (total: ${sessions.size})`);
           });
+
           await connection.connect(transport);
+
         } else if (req.method === 'POST' && url.pathname === '/messages') {
           const sessionId = url.searchParams.get('sessionId');
           const session = sessions.get(sessionId);
@@ -100,13 +106,31 @@ program
         }
       });
 
+      const shutdown = () => {
+        for (const [id, session] of sessions) {
+          session.backend.serverClosed();
+        }
+        sessions.clear();
+        sharedCore.dispose();
+        httpServer.close();
+      };
+
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
       httpServer.listen(port, host, () => {
         console.error(`[MCP] SSE server listening on http://${host}:${port}/sse`);
-        console.error(`[MCP] Each session gets its own browser context`);
+        console.error(`[MCP] Multi-session mode: all clients share one browser, tabs isolated per session`);
       });
+
     } else {
-      // Stdio transport — single session (default)
-      const connection = await createCustomConnection(config);
+      const backend = new SessionBrowserBackend('stdio', sharedCore);
+      const connection = mcpServer.createServer(
+        'Playwright-Custom',
+        packageJSON.version,
+        backend,
+        false
+      );
       const transport = new StdioServerTransport();
       await connection.connect(transport);
     }

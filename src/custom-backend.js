@@ -1,21 +1,26 @@
 /**
  * Custom Browser Server Backend
- * 
- * Extends Playwright MCP with:
- * - Snapshot caching for large pages
- * - Recording system for debugging dynamic UI
- * - Tab isolation for multi-agent support
- * 
+ *
+ * Architecture for multi-session SSE support:
+ *
+ *   SharedBrowserCore  (one per server process)
+ *     - Owns the single Context + browser lifecycle
+ *     - Holds tools that are session-independent (tab-aware wrappers, cache, recording)
+ *     - Lazy-initializes browser on first tool call from any session
+ *
+ *   SessionBrowserBackend  (one per SSE / stdio session)
+ *     - Implements MCP backend interface (listTools, callTool, serverClosed)
+ *     - Combines shared tools with session-scoped tools (browser_tabs, browser_close)
+ *     - On disconnect, cleans up only this session's tabs
+ *
  * @module custom-backend
  */
 
 const path = require('path');
 
-// Direct paths to playwright internals
 const playwrightPath = path.dirname(require.resolve('playwright/package.json'));
 const mcpPath = path.join(playwrightPath, 'lib', 'mcp');
 
-// Use zod from playwright-core bundle (compatible with zodToJsonSchema)
 const { z } = require('playwright-core/lib/mcpBundle');
 
 const { Context } = require(path.join(mcpPath, 'browser', 'context'));
@@ -28,17 +33,15 @@ const snapshotCache = require('./snapshot-cache-enhanced');
 const recordingManager = require('./recording-manager');
 const { createRecordingTools } = require('./recording-tools');
 const outputCache = require('./output-cache');
-const { createTabAwareTools, createEnhancedTabsTool } = require('./tab-isolation');
+const { createTabAwareTools, createEnhancedTabsTool, createSessionCloseTool, cleanupSession } = require('./tab-isolation');
 
-// Patched Response class - handles all large outputs
 class PatchedResponse extends OriginalResponse {
   serialize(options = {}) {
     const result = super.serialize(options);
-    
+
     if (result.content?.[0]?.type === 'text') {
       let text = result.content[0].text;
-      
-      // 1. Handle snapshot caching (YAML blocks)
+
       const yamlMatch = text.match(/```yaml\n([\s\S]*?)\n```/);
       if (yamlMatch?.[1] && snapshotCache.needsPagination(yamlMatch[1])) {
         const snapshotContent = yamlMatch[1];
@@ -46,15 +49,15 @@ class PatchedResponse extends OriginalResponse {
         const titleMatch = text.match(/- Page Title: (.+)/);
         const url = urlMatch?.[1] || 'unknown';
         const title = titleMatch?.[1] || 'unknown';
-        
+
         const { cacheId, totalLines, structureHints } = snapshotCache.cacheSnapshot(
           snapshotContent, url, title
         );
-        
+
         const paginationMsg = snapshotCache.formatPaginationMessage(
           cacheId, totalLines, url, title, structureHints
         );
-        
+
         text = text.replace(
           /- Page Snapshot:\n```yaml\n[\s\S]*?\n```/,
           paginationMsg
@@ -62,20 +65,19 @@ class PatchedResponse extends OriginalResponse {
         result.content[0].text = text;
         return result;
       }
-      
-      // 2. Handle any other large output (console, network, etc.)
+
       if (outputCache.needsCaching(text)) {
         const toolName = this._name || 'unknown';
         const { cacheId, totalLines, preview } = outputCache.cacheOutput(text, toolName);
         result.content[0].text = outputCache.formatCacheMessage(cacheId, totalLines, toolName, preview);
       }
     }
-    
+
     return result;
   }
 }
 
-// Custom tools for cache navigation - using real zod schemas
+// Cache navigation tools — stateless, shared across sessions
 const getCachedSnapshotTool = {
   schema: {
     name: 'get_cached_snapshot',
@@ -90,22 +92,11 @@ const getCachedSnapshotTool = {
   },
   capability: 'core',
   handle: async (context, params, response) => {
-    const result = snapshotCache.getPaginatedContent(
-      params.cacheId,
-      params.startLine || 1,
-      params.endLine
-    );
-
-    if (result.error) {
-      response.addError(result.error);
-      return;
-    }
-
+    const result = snapshotCache.getPaginatedContent(params.cacheId, params.startLine || 1, params.endLine);
+    if (result.error) { response.addError(result.error); return; }
     let text = `Lines ${result.startLine}-${result.endLine} of ${result.totalLines}:\n`;
     text += '```yaml\n' + result.content + '\n```';
-    if (result.hasMore) {
-      text += `\n\n_More available. Next: startLine=${result.endLine + 1}_`;
-    }
+    if (result.hasMore) text += `\n\n_More available. Next: startLine=${result.endLine + 1}_`;
     response.addResult(text);
   }
 };
@@ -124,26 +115,14 @@ const searchCachedSnapshotTool = {
   },
   capability: 'core',
   handle: async (context, params, response) => {
-    const result = snapshotCache.searchInCache(
-      params.cacheId,
-      params.query,
-      params.maxResults || 10
-    );
-
-    if (result.error) {
-      response.addError(result.error);
-      return;
-    }
-
+    const result = snapshotCache.searchInCache(params.cacheId, params.query, params.maxResults || 10);
+    if (result.error) { response.addError(result.error); return; }
     let text = `Search "${result.query}" - ${result.totalMatches} matches:\n\n`;
-    for (const match of result.results) {
-      text += `Line ${match.line}: ${match.content}\n`;
-    }
+    for (const match of result.results) text += `Line ${match.line}: ${match.content}\n`;
     response.addResult(text);
   }
 };
 
-// Universal output cache tools
 const getCachedOutputTool = {
   schema: {
     name: 'get_cached_output',
@@ -158,22 +137,11 @@ const getCachedOutputTool = {
   },
   capability: 'core',
   handle: async (context, params, response) => {
-    const result = outputCache.getPaginatedContent(
-      params.cacheId,
-      params.startLine || 1,
-      params.endLine
-    );
-
-    if (result.error) {
-      response.addError(result.error);
-      return;
-    }
-
+    const result = outputCache.getPaginatedContent(params.cacheId, params.startLine || 1, params.endLine);
+    if (result.error) { response.addError(result.error); return; }
     let text = `## Output (${result.startLine}-${result.endLine} of ${result.totalLines})\n\n`;
     text += '```\n' + result.content + '\n```';
-    if (result.hasMore) {
-      text += `\n\n_More available. Next: startLine=${result.endLine + 1}_`;
-    }
+    if (result.hasMore) text += `\n\n_More available. Next: startLine=${result.endLine + 1}_`;
     response.addResult(text);
   }
 };
@@ -192,40 +160,32 @@ const searchCachedOutputTool = {
   },
   capability: 'core',
   handle: async (context, params, response) => {
-    const result = outputCache.searchInCache(
-      params.cacheId,
-      params.query,
-      params.maxResults || 20
-    );
-
-    if (result.error) {
-      response.addError(result.error);
-      return;
-    }
-
+    const result = outputCache.searchInCache(params.cacheId, params.query, params.maxResults || 20);
+    if (result.error) { response.addError(result.error); return; }
     let text = `## Search "${result.query}" - ${result.totalMatches} matches\n\n`;
-    for (const match of result.results) {
-      text += `**L${match.line}:** ${match.content}\n`;
-    }
+    for (const match of result.results) text += `**L${match.line}:** ${match.content}\n`;
     response.addResult(text);
   }
 };
 
-class CustomBrowserServerBackend {
+
+/**
+ * Shared browser infrastructure — one per server process.
+ * Manages the single Context/browser and holds session-independent tools.
+ */
+class SharedBrowserCore {
   constructor(config, factory) {
     this._config = config;
     this._browserContextFactory = factory;
-    
-    // Get custom tools
+    this._context = null;
+    this._initPromise = null;
+    this._sessionCount = 0;
+
     const recordingTools = createRecordingTools();
-    
-    // Use tab-aware tools instead of original filteredTools
     const tabAwareTools = createTabAwareTools(config);
-    const enhancedTabsTool = createEnhancedTabsTool();
-    
-    this._tools = [
+
+    this._sharedTools = [
       ...tabAwareTools,
-      enhancedTabsTool,
       getCachedSnapshotTool,
       searchCachedSnapshotTool,
       getCachedOutputTool,
@@ -235,8 +195,16 @@ class CustomBrowserServerBackend {
   }
 
   async initialize(clientInfo) {
-    this._sessionLog = this._config.saveSession 
-      ? await SessionLog.create(this._config, clientInfo) 
+    if (!this._initPromise) {
+      this._initPromise = this._doInitialize(clientInfo);
+      this._initPromise.catch(() => { this._initPromise = null; });
+    }
+    return this._initPromise;
+  }
+
+  async _doInitialize(clientInfo) {
+    this._sessionLog = this._config.saveSession
+      ? await SessionLog.create(this._config, clientInfo)
       : undefined;
     this._context = new Context({
       config: this._config,
@@ -244,41 +212,108 @@ class CustomBrowserServerBackend {
       sessionLog: this._sessionLog,
       clientInfo
     });
+
+    // Prevent browser auto-close when last tab closes.
+    // Context._onPageClosed calls closeBrowserContext() when _tabs empties —
+    // in multi-session mode that would kill the browser under active sessions.
+    // Browser only shuts down on server process exit via dispose().
+    this._originalCloseBrowserContext = this._context.closeBrowserContext.bind(this._context);
+    this._context.closeBrowserContext = async () => {};
+  }
+
+  get context() { return this._context; }
+  get sharedTools() { return this._sharedTools; }
+
+  addSession() { this._sessionCount++; }
+
+  removeSession() {
+    this._sessionCount--;
+    if (this._sessionCount <= 0) {
+      this._sessionCount = 0;
+      // Browser stays alive — Context._onPageClosed handles cleanup
+      // when the last tab closes. No need to force-dispose here;
+      // the browser re-launches lazily on next use if needed.
+    }
+  }
+
+  dispose() {
+    recordingManager.cleanupAll();
+    if (this._context) {
+      // Restore real closeBrowserContext so dispose() actually shuts down Chrome
+      if (this._originalCloseBrowserContext) {
+        this._context.closeBrowserContext = this._originalCloseBrowserContext;
+      }
+      this._context.dispose().catch(logUnhandledError);
+    }
+    this._context = null;
+    this._initPromise = null;
+  }
+}
+
+
+/**
+ * Per-session backend implementing the MCP backend interface.
+ * Delegates to SharedBrowserCore for browser operations.
+ * Owns session-scoped tools (browser_tabs, browser_close).
+ */
+class SessionBrowserBackend {
+  constructor(sessionId, sharedCore) {
+    this._sessionId = sessionId;
+    this._core = sharedCore;
+    this._core.addSession();
+
+    this._sessionTools = [
+      createEnhancedTabsTool(sessionId),
+      createSessionCloseTool(sessionId)
+    ];
+
+    this._allTools = [...this._core.sharedTools, ...this._sessionTools];
+  }
+
+  async initialize(clientInfo) {
+    await this._core.initialize(clientInfo);
   }
 
   async listTools() {
-    return this._tools.map(tool => toMcpTool(tool.schema));
+    return this._allTools.map(tool => toMcpTool(tool.schema));
   }
 
   async callTool(name, rawArguments) {
-    const tool = this._tools.find(t => t.schema.name === name);
+    const tool = this._allTools.find(t => t.schema.name === name);
     if (!tool) throw new Error(`Tool "${name}" not found`);
 
     const parsedArguments = tool.schema.inputSchema.parse(rawArguments || {});
-    const response = new PatchedResponse(this._context, name, parsedArguments);
-    
+    const context = this._core.context;
+    const response = new PatchedResponse(context, name, parsedArguments);
+
     response.logBegin();
-    this._context.setRunningTool(name);
-    
+    context.setRunningTool(name);
+
     try {
-      await tool.handle(this._context, parsedArguments, response);
+      await tool.handle(context, parsedArguments, response);
       await response.finish();
-      this._sessionLog?.logResponse(response);
+      this._core._sessionLog?.logResponse(response);
     } catch (error) {
       response.addError(String(error));
     } finally {
-      this._context.setRunningTool(undefined);
+      context.setRunningTool(undefined);
     }
-    
+
     response.logEnd();
     return response.serialize();
   }
 
   serverClosed() {
-    // Cleanup recordings on browser close
-    recordingManager.cleanupAll();
-    this._context?.dispose().catch(logUnhandledError);
+    if (this._closed) return;
+    this._closed = true;
+
+    const context = this._core.context;
+    if (context) {
+      cleanupSession(this._sessionId, context);
+    }
+    this._core.removeSession();
   }
 }
 
-module.exports = { CustomBrowserServerBackend };
+
+module.exports = { SharedBrowserCore, SessionBrowserBackend, PatchedResponse };
