@@ -219,6 +219,34 @@ class SharedBrowserCore {
     // Browser only shuts down on server process exit via dispose().
     this._originalCloseBrowserContext = this._context.closeBrowserContext.bind(this._context);
     this._context.closeBrowserContext = async () => {};
+
+    // Recover from browser disconnect (e.g. Chrome restarts while daemon is running).
+    // The factory already clears its _browserPromise on disconnect, but the Context
+    // still holds _browserContextPromise pointing at the dead browser context.
+    // The no-op closeBrowserContext prevents normal cleanup from clearing it.
+    // Clear it here so the next tool call re-enters _ensureBrowserContext and reconnects.
+    this._hookBrowserDisconnect();
+  }
+
+  _hookBrowserDisconnect() {
+    // Wrap _ensureBrowserContext to attach a disconnect handler after the first
+    // successful browser creation. Preserves lazy init — browser is NOT launched here.
+    const origEnsure = this._context._ensureBrowserContext.bind(this._context);
+    const self = this;
+    this._context._ensureBrowserContext = function () {
+      const promise = origEnsure();
+      promise.then(({ browserContext }) => {
+        const browser = browserContext.browser();
+        if (browser && !browser._mcpDisconnectHooked) {
+          browser._mcpDisconnectHooked = true;
+          browser.on('disconnected', () => {
+            self._context._browserContextPromise = undefined;
+            self._context._browserContext = undefined;
+          });
+        }
+      }).catch(() => {});
+      return promise;
+    };
   }
 
   get context() { return this._context; }
