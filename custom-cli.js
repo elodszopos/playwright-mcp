@@ -9,6 +9,7 @@
  */
 
 const path = require('path');
+const os = require('os');
 
 const playwrightCorePath = path.dirname(require.resolve('playwright-core/package.json'));
 const playwrightPath = path.dirname(require.resolve('playwright/package.json'));
@@ -55,6 +56,14 @@ program
     if (options.vision) config.vision = true;
 
     const resolvedConfig = await resolveConfig(config);
+
+    // Pin one persistent profile dir so every launch reuses the same browser
+    // profile (consistent logins/cookies). Honors PLAYWRIGHT_MCP_USER_DATA_DIR,
+    // else a fixed fallback -- never the lib's volatile default.
+    resolvedConfig.browser = resolvedConfig.browser ?? {};
+    resolvedConfig.browser.userDataDir = process.env.PLAYWRIGHT_MCP_USER_DATA_DIR
+      || path.join(os.homedir(), '.playwright-mcp-profile');
+
     const factory = contextFactory(resolvedConfig);
     const sharedCore = new SharedBrowserCore(resolvedConfig, factory);
 
