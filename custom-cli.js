@@ -16,7 +16,7 @@ const playwrightPath = path.dirname(require.resolve('playwright/package.json'));
 const mcpPath = path.join(playwrightPath, 'lib', 'mcp');
 
 const { program } = require(path.join(playwrightCorePath, 'lib', 'utilsBundle'));
-const { resolveConfig } = require(path.join(mcpPath, 'browser', 'config'));
+const { resolveCLIConfig } = require(path.join(mcpPath, 'browser', 'config'));
 const { contextFactory } = require(path.join(mcpPath, 'browser', 'browserContextFactory'));
 const mcpServer = require(path.join(mcpPath, 'sdk', 'server'));
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -29,7 +29,7 @@ const packageJSON = require('./package.json');
 program
   .version('Version ' + packageJSON.version)
   .name('Playwright MCP Custom')
-  .option('--browser <browser>', 'Browser type: chromium, firefox, webkit', 'chromium')
+  .option('--browser <browser>', 'Browser or channel: chrome, chromium, firefox, webkit')
   .option('--headless', 'Run in headless mode')
   .option('--port <port>', 'Port for SSE transport')
   .option('--host <host>', 'Host for SSE transport')
@@ -50,12 +50,7 @@ program
       console.error(`[MCP] Cache location: ~/Downloads/rejust-searches/${cache.getSearchContext()}/`);
     }
 
-    const config = {};
-    if (options.browser) config.browser = { browserName: options.browser };
-    if (options.headless) config.browser = { ...config.browser, headless: true };
-    if (options.vision) config.vision = true;
-
-    const resolvedConfig = await resolveConfig(config);
+    const resolvedConfig = await resolveCLIConfig(options);
 
     // Pin one persistent profile dir so every launch reuses the same browser
     // profile (consistent logins/cookies). Honors PLAYWRIGHT_MCP_USER_DATA_DIR,
