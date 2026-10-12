@@ -11,7 +11,7 @@
  *   SessionBrowserBackend  (one per SSE / stdio session)
  *     - Implements MCP backend interface (listTools, callTool, serverClosed)
  *     - Combines shared tools with session-scoped tools (browser_tabs, browser_close)
- *     - On disconnect, cleans up only this session's tabs
+ *     - On disconnect, leaves this session's tabs open for the next session to adopt
  *
  * @module custom-backend
  */
@@ -33,7 +33,7 @@ const snapshotCache = require('./snapshot-cache-enhanced');
 const recordingManager = require('./recording-manager');
 const { createRecordingTools } = require('./recording-tools');
 const outputCache = require('./output-cache');
-const { createTabAwareTools, createEnhancedTabsTool, createSessionCloseTool, cleanupSession } = require('./tab-isolation');
+const { createTabAwareTools, createEnhancedTabsTool, createSessionCloseTool, orphanSession } = require('./tab-isolation');
 
 class PatchedResponse extends OriginalResponse {
   serialize(options = {}) {
@@ -335,10 +335,7 @@ class SessionBrowserBackend {
     if (this._closed) return;
     this._closed = true;
 
-    const context = this._core.context;
-    if (context) {
-      cleanupSession(this._sessionId, context);
-    }
+    orphanSession(this._sessionId);
     this._core.removeSession();
   }
 }

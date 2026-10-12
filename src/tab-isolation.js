@@ -177,6 +177,74 @@ function createTabAwareTools(config) {
   }).filter(Boolean);
 }
 
+function registerTab(tab, page, sessionId) {
+  const tabId = generateTabId();
+
+  tabRegistry.set(tabId, {
+    page,
+    tab,
+    createdAt: new Date(),
+    title: 'New Tab',
+    sessionId
+  });
+
+  if (typeof page.on === 'function') {
+    page.on('close', () => {
+      const currentEntry = tabRegistry.get(tabId);
+      if (currentEntry && currentEntry.page === page) {
+        tabRegistry.delete(tabId);
+      }
+    });
+
+    page.on('load', async () => {
+      const entry = tabRegistry.get(tabId);
+      if (entry) {
+        try {
+          entry.title = await page.title() || 'Untitled';
+        } catch (e) { /* page might be closed */ }
+      }
+    });
+  }
+
+  return tabId;
+}
+
+// Claims tabs whose session disconnected, and registers pages nobody registered (opened by hand).
+function adoptTabs(context, sessionId) {
+  const adopted = new Set();
+
+  for (const [id, entry] of tabRegistry.entries()) {
+    if (entry.sessionId === null) {
+      entry.sessionId = sessionId;
+      adopted.add(id);
+    }
+  }
+
+  const registeredPages = new Set([...tabRegistry.values()].map(entry => entry.page));
+  for (const tab of context.tabs()) {
+    const page = tab.page || tab;
+    if (!registeredPages.has(page)) {
+      adopted.add(registerTab(tab, page, sessionId));
+    }
+  }
+
+  return adopted;
+}
+
+// A disconnected session's tabs stay open for the next session to adopt.
+function orphanSession(sessionId) {
+  let orphaned = 0;
+
+  for (const entry of tabRegistry.values()) {
+    if (entry.sessionId === sessionId) {
+      entry.sessionId = null;
+      orphaned++;
+    }
+  }
+
+  return orphaned;
+}
+
 /**
  * Session-scoped browser_tabs tool.
  * Each session gets its own instance with sessionId baked in via closure.
@@ -186,7 +254,7 @@ function createEnhancedTabsTool(sessionId) {
     schema: {
       name: 'browser_tabs',
       title: 'Manage tabs',
-      description: 'Create, close, or list browser tabs. Use action="new" to create a tab and get your tabId (6-char string). Use action="close" with your tabId to close it. Use action="list" to see all tabs with their IDs and titles.',
+      description: 'Create, close, or list browser tabs. Use action="new" to create a tab and get your tabId (6-char string). Use action="close" with your tabId to close it. Use action="list" to see your tabs with their IDs and titles; list also adopts tabs left open by a disconnected session and tabs opened by hand, so call it before creating a new tab.',
       inputSchema: z.object({
         action: z.enum(['new', 'close', 'list']).describe('Operation: "new" to create tab, "close" to close tab, "list" to see all tabs'),
         tabId: z.string().length(6).optional().describe('Tab ID (6-char string) to close (required for close action)')
@@ -198,35 +266,7 @@ function createEnhancedTabsTool(sessionId) {
       switch (params.action) {
         case 'new': {
           const { tab, page } = await createBackgroundTab(context);
-          const tabId = generateTabId();
-
-          tabRegistry.set(tabId, {
-            page,
-            tab,
-            createdAt: new Date(),
-            title: 'New Tab',
-            sessionId
-          });
-
-          const pageRef = page;
-          const thisTabId = tabId;
-          if (typeof page.on === 'function') {
-            page.on('close', () => {
-              const currentEntry = tabRegistry.get(thisTabId);
-              if (currentEntry && currentEntry.page === pageRef) {
-                tabRegistry.delete(thisTabId);
-              }
-            });
-          }
-
-          page.on('load', async () => {
-            const entry = tabRegistry.get(tabId);
-            if (entry) {
-              try {
-                entry.title = await page.title() || 'Untitled';
-              } catch (e) { /* page might be closed */ }
-            }
-          });
+          const tabId = registerTab(tab, page, sessionId);
 
           response.addResult(
             `## Tab Created\n\n` +
@@ -267,6 +307,7 @@ function createEnhancedTabsTool(sessionId) {
         }
 
         case 'list': {
+          const adopted = adoptTabs(context, sessionId);
           const tabs = context.tabs();
           const tabList = [];
 
@@ -292,7 +333,7 @@ function createEnhancedTabsTool(sessionId) {
               }
             } catch (e) { /* keep defaults */ }
 
-            tabList.push({ id, title, url, createdAt: entry.createdAt.toISOString() });
+            tabList.push({ id, title: adopted.has(id) ? `(adopted) ${title}` : title, url, createdAt: entry.createdAt.toISOString() });
           }
 
           if (tabList.length === 0) {
@@ -387,6 +428,8 @@ module.exports = {
   createEnhancedTabsTool,
   createSessionCloseTool,
   cleanupSession,
+  orphanSession,
+  adoptTabs,
   getTabRegistry,
   TAB_AWARE_TOOLS
 };
