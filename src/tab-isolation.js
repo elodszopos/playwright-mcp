@@ -1,13 +1,4 @@
-/**
- * Tab Isolation Module
- *
- * Provides tab-aware tool wrappers that allow multi-session browser access.
- * Each session owns its tabs via a session-tagged global registry.
- * Tab IDs are globally unique 6-char strings; session ownership is tracked
- * so list/cleanup operations scope to the owning session.
- *
- * @module tab-isolation
- */
+// Tab-aware tool wrappers: every browser tool addresses its tab by a globally unique 6-char tabId.
 
 const path = require('path');
 const { z } = require('playwright-core/lib/mcpBundle');
@@ -16,7 +7,7 @@ const playwrightPath = path.dirname(require.resolve('playwright/package.json'));
 const mcpPath = path.join(playwrightPath, 'lib', 'mcp');
 const { filteredTools } = require(path.join(mcpPath, 'browser', 'tools'));
 
-// Global registry: tabId -> { page, tab, createdAt, title, sessionId }
+// Global registry: tabId -> { page, tab, createdAt, title }
 const tabRegistry = new Map();
 
 function generateTabId() {
@@ -177,11 +168,7 @@ function createTabAwareTools(config) {
   }).filter(Boolean);
 }
 
-/**
- * Session-scoped browser_tabs tool.
- * Each session gets its own instance with sessionId baked in via closure.
- */
-function createEnhancedTabsTool(sessionId) {
+function createTabsTool() {
   return {
     schema: {
       name: 'browser_tabs',
@@ -204,8 +191,7 @@ function createEnhancedTabsTool(sessionId) {
             page,
             tab,
             createdAt: new Date(),
-            title: 'New Tab',
-            sessionId
+            title: 'New Tab'
           });
 
           const pageRef = page;
@@ -271,8 +257,6 @@ function createEnhancedTabsTool(sessionId) {
           const tabList = [];
 
           for (const [id, entry] of tabRegistry.entries()) {
-            if (entry.sessionId !== sessionId) continue;
-
             const tabIndex = tabs.findIndex(t => t === entry.tab || t === entry.page || t.page === entry.page);
             if (tabIndex === -1) {
               tabRegistry.delete(id);
@@ -298,7 +282,7 @@ function createEnhancedTabsTool(sessionId) {
           if (tabList.length === 0) {
             response.addResult(
               `## No Tabs\n\n` +
-              `No tabs are currently open for this session.\n` +
+              `No tabs are currently open.\n` +
               `Use \`browser_tabs(action="new")\` to create one.`
             );
             return;
@@ -325,54 +309,6 @@ function createEnhancedTabsTool(sessionId) {
   };
 }
 
-/**
- * Session-scoped browser_close tool.
- * Closes only the calling session's tabs instead of killing the browser.
- */
-function createSessionCloseTool(sessionId) {
-  return {
-    schema: {
-      name: 'browser_close',
-      title: 'Close session tabs',
-      description: 'Close all tabs owned by this session. The browser stays running for other sessions.',
-      inputSchema: z.object({}),
-      type: 'action'
-    },
-    capability: 'core',
-    handle: async (context, params, response) => {
-      const closed = cleanupSession(sessionId, context);
-      response.addResult(`Closed ${closed} tab(s) for this session.`);
-    }
-  };
-}
-
-/**
- * Close all tabs belonging to a session.
- * Closes pages directly to avoid index-shifting bugs.
- * Returns the number of tabs closed.
- */
-function cleanupSession(sessionId, context) {
-  let closed = 0;
-  const toClose = [];
-
-  for (const [tabId, entry] of tabRegistry.entries()) {
-    if (entry.sessionId !== sessionId) continue;
-    toClose.push({ tabId, page: entry.page });
-  }
-
-  for (const { tabId, page } of toClose) {
-    tabRegistry.delete(tabId);
-    try {
-      if (page && typeof page.isClosed === 'function' && !page.isClosed()) {
-        page.close().catch(() => {});
-      }
-    } catch (e) { /* best effort */ }
-    closed++;
-  }
-
-  return closed;
-}
-
 function getTabRegistry() {
   return tabRegistry;
 }
@@ -384,9 +320,7 @@ module.exports = {
   createTabProxyContext,
   wrapToolWithTabId,
   createTabAwareTools,
-  createEnhancedTabsTool,
-  createSessionCloseTool,
-  cleanupSession,
+  createTabsTool,
   getTabRegistry,
   TAB_AWARE_TOOLS
 };

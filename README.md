@@ -397,7 +397,6 @@ browser_recording_snapshot {
 | Tool | Description |
 |------|-------------|
 | `browser_install` | Install browser |
-| `browser_close` | Close entire browser |
 
 ---
 

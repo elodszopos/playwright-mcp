@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-// HTTP mode (streamable HTTP at /mcp): one SessionBrowserBackend and MCP server per client session,
-// all sharing one browser with tabs isolated per session. Stdio mode: a single session.
+// HTTP mode: stateless streamable HTTP at /mcp, a fresh MCP server per POST over one shared BrowserBackend.
 
 const path = require('path');
 const os = require('os');
@@ -15,9 +14,8 @@ const { contextFactory } = require(path.join(mcpPath, 'browser', 'browserContext
 const mcpServer = require(path.join(mcpPath, 'sdk', 'server'));
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
-const { randomUUID } = require('crypto');
 const http = require('http');
-const { SharedBrowserCore, SessionBrowserBackend } = require('./src/custom-backend');
+const { BrowserBackend } = require('./src/custom-backend');
 
 const packageJSON = require('./package.json');
 
@@ -55,71 +53,35 @@ program
       || path.join(os.homedir(), '.playwright-mcp-profile');
 
     const factory = contextFactory(resolvedConfig);
-    const sharedCore = new SharedBrowserCore(resolvedConfig, factory);
+    const backend = new BrowserBackend(resolvedConfig, factory);
+    const createServer = () => mcpServer.createServer('Playwright-Custom', packageJSON.version, backend, false);
 
     if (options.port) {
       const port = parseInt(options.port, 10);
       const host = options.host || 'localhost';
-      const sessions = new Map();
-
-      const openSession = (id, transport) => {
-        const backend = new SessionBrowserBackend(id, sharedCore);
-        const connection = mcpServer.createServer('Playwright-Custom', packageJSON.version, backend, false);
-        sessions.set(id, { transport, connection, backend });
-        console.error(`[MCP] client connected: ${id} (total: ${sessions.size})`);
-        return connection;
-      };
-
-      const closeSession = (id) => {
-        const session = sessions.get(id);
-        if (session) {
-          session.backend.serverClosed();
-          sessions.delete(id);
-          console.error(`[MCP] client disconnected: ${id} (total: ${sessions.size})`);
-        }
-      };
-
-      const handleStreamable = async (req, res) => {
-        const requested = req.headers['mcp-session-id'];
-        if (requested) {
-          const session = sessions.get(requested);
-          if (!session) {
-            res.writeHead(404).end('Unknown session');
-            return;
-          }
-          await session.transport.handleRequest(req, res);
-          return;
-        }
-        if (req.method !== 'POST') {
-          res.writeHead(400).end('Missing mcp-session-id');
-          return;
-        }
-        const id = randomUUID();
-        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => id });
-        transport.onclose = () => closeSession(id);
-        await openSession(id, transport).connect(transport);
-        await transport.handleRequest(req, res);
-        if (!transport.sessionId) {
-          await transport.close();
-        }
-      };
 
       const httpServer = http.createServer(async (req, res) => {
         const url = new URL(req.url, `http://${host}`);
-
-        if (url.pathname === '/mcp') {
-          await handleStreamable(req, res);
-        } else {
+        if (url.pathname !== '/mcp') {
           res.writeHead(404).end();
+          return;
         }
+        if (req.method !== 'POST') {
+          res.writeHead(405, { Allow: 'POST' }).end();
+          return;
+        }
+        const server = createServer();
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        res.on('close', () => {
+          transport.close();
+          server.close();
+        });
+        await server.connect(transport);
+        await transport.handleRequest(req, res);
       });
 
       const shutdown = () => {
-        for (const session of sessions.values()) {
-          session.backend.serverClosed();
-        }
-        sessions.clear();
-        sharedCore.dispose();
+        backend.dispose();
         httpServer.close();
       };
 
@@ -127,20 +89,11 @@ program
       process.on('SIGTERM', shutdown);
 
       httpServer.listen(port, host, () => {
-        console.error(`[MCP] listening on http://${host}:${port}/mcp (streamable HTTP)`);
-        console.error(`[MCP] Multi-session mode: all clients share one browser, tabs isolated per session`);
+        console.error(`[MCP] listening on http://${host}:${port}/mcp (stateless streamable HTTP, one shared browser)`);
       });
 
     } else {
-      const backend = new SessionBrowserBackend('stdio', sharedCore);
-      const connection = mcpServer.createServer(
-        'Playwright-Custom',
-        packageJSON.version,
-        backend,
-        false
-      );
-      const transport = new StdioServerTransport();
-      await connection.connect(transport);
+      await createServer().connect(new StdioServerTransport());
     }
   });
 

@@ -1,20 +1,4 @@
-/**
- * Custom Browser Server Backend
- *
- * Architecture for multi-session SSE support:
- *
- *   SharedBrowserCore  (one per server process)
- *     - Owns the single Context + browser lifecycle
- *     - Holds tools that are session-independent (tab-aware wrappers, cache, recording)
- *     - Lazy-initializes browser on first tool call from any session
- *
- *   SessionBrowserBackend  (one per SSE / stdio session)
- *     - Implements MCP backend interface (listTools, callTool, serverClosed)
- *     - Combines shared tools with session-scoped tools (browser_tabs, browser_close)
- *     - On disconnect, cleans up only this session's tabs
- *
- * @module custom-backend
- */
+// One BrowserBackend per process: one browser shared by every client, each tab addressed by its tabId.
 
 const path = require('path');
 
@@ -33,7 +17,7 @@ const snapshotCache = require('./snapshot-cache-enhanced');
 const recordingManager = require('./recording-manager');
 const { createRecordingTools } = require('./recording-tools');
 const outputCache = require('./output-cache');
-const { createTabAwareTools, createEnhancedTabsTool, createSessionCloseTool, cleanupSession } = require('./tab-isolation');
+const { createTabAwareTools, createTabsTool } = require('./tab-isolation');
 
 class PatchedResponse extends OriginalResponse {
   serialize(options = {}) {
@@ -169,28 +153,21 @@ const searchCachedOutputTool = {
 };
 
 
-/**
- * Shared browser infrastructure — one per server process.
- * Manages the single Context/browser and holds session-independent tools.
- */
-class SharedBrowserCore {
+class BrowserBackend {
   constructor(config, factory) {
     this._config = config;
     this._browserContextFactory = factory;
     this._context = null;
     this._initPromise = null;
-    this._sessionCount = 0;
 
-    const recordingTools = createRecordingTools();
-    const tabAwareTools = createTabAwareTools(config);
-
-    this._sharedTools = [
-      ...tabAwareTools,
+    this._tools = [
+      ...createTabAwareTools(config),
+      createTabsTool(),
       getCachedSnapshotTool,
       searchCachedSnapshotTool,
       getCachedOutputTool,
       searchCachedOutputTool,
-      ...recordingTools
+      ...createRecordingTools()
     ];
   }
 
@@ -215,7 +192,7 @@ class SharedBrowserCore {
 
     // Prevent browser auto-close when last tab closes.
     // Context._onPageClosed calls closeBrowserContext() when _tabs empties —
-    // in multi-session mode that would kill the browser under active sessions.
+    // that would kill the browser under other clients' tabs.
     // Browser only shuts down on server process exit via dispose().
     this._originalCloseBrowserContext = this._context.closeBrowserContext.bind(this._context);
     this._context.closeBrowserContext = async () => {};
@@ -249,19 +226,33 @@ class SharedBrowserCore {
     };
   }
 
-  get context() { return this._context; }
-  get sharedTools() { return this._sharedTools; }
+  async listTools() {
+    return this._tools.map(tool => toMcpTool(tool.schema));
+  }
 
-  addSession() { this._sessionCount++; }
+  async callTool(name, rawArguments) {
+    const tool = this._tools.find(t => t.schema.name === name);
+    if (!tool) throw new Error(`Tool "${name}" not found`);
 
-  removeSession() {
-    this._sessionCount--;
-    if (this._sessionCount <= 0) {
-      this._sessionCount = 0;
-      // Browser stays alive — Context._onPageClosed handles cleanup
-      // when the last tab closes. No need to force-dispose here;
-      // the browser re-launches lazily on next use if needed.
+    const parsedArguments = tool.schema.inputSchema.parse(rawArguments || {});
+    const context = this._context;
+    const response = new PatchedResponse(context, name, parsedArguments);
+
+    response.logBegin();
+    context.setRunningTool(name);
+
+    try {
+      await tool.handle(context, parsedArguments, response);
+      await response.finish();
+      this._sessionLog?.logResponse(response);
+    } catch (error) {
+      response.addError(String(error));
+    } finally {
+      context.setRunningTool(undefined);
     }
+
+    response.logEnd();
+    return response.serialize();
   }
 
   dispose() {
@@ -279,69 +270,4 @@ class SharedBrowserCore {
 }
 
 
-/**
- * Per-session backend implementing the MCP backend interface.
- * Delegates to SharedBrowserCore for browser operations.
- * Owns session-scoped tools (browser_tabs, browser_close).
- */
-class SessionBrowserBackend {
-  constructor(sessionId, sharedCore) {
-    this._sessionId = sessionId;
-    this._core = sharedCore;
-    this._core.addSession();
-
-    this._sessionTools = [
-      createEnhancedTabsTool(sessionId),
-      createSessionCloseTool(sessionId)
-    ];
-
-    this._allTools = [...this._core.sharedTools, ...this._sessionTools];
-  }
-
-  async initialize(clientInfo) {
-    await this._core.initialize(clientInfo);
-  }
-
-  async listTools() {
-    return this._allTools.map(tool => toMcpTool(tool.schema));
-  }
-
-  async callTool(name, rawArguments) {
-    const tool = this._allTools.find(t => t.schema.name === name);
-    if (!tool) throw new Error(`Tool "${name}" not found`);
-
-    const parsedArguments = tool.schema.inputSchema.parse(rawArguments || {});
-    const context = this._core.context;
-    const response = new PatchedResponse(context, name, parsedArguments);
-
-    response.logBegin();
-    context.setRunningTool(name);
-
-    try {
-      await tool.handle(context, parsedArguments, response);
-      await response.finish();
-      this._core._sessionLog?.logResponse(response);
-    } catch (error) {
-      response.addError(String(error));
-    } finally {
-      context.setRunningTool(undefined);
-    }
-
-    response.logEnd();
-    return response.serialize();
-  }
-
-  serverClosed() {
-    if (this._closed) return;
-    this._closed = true;
-
-    const context = this._core.context;
-    if (context) {
-      cleanupSession(this._sessionId, context);
-    }
-    this._core.removeSession();
-  }
-}
-
-
-module.exports = { SharedBrowserCore, SessionBrowserBackend, PatchedResponse };
+module.exports = { BrowserBackend, PatchedResponse };
