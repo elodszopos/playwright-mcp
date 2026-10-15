@@ -208,17 +208,17 @@ class BrowserBackend {
   _hookBrowserDisconnect() {
     // Wrap _ensureBrowserContext to attach a disconnect handler after the first
     // successful browser creation. Preserves lazy init — browser is NOT launched here.
-    const origEnsure = this._context._ensureBrowserContext.bind(this._context);
-    const self = this;
-    this._context._ensureBrowserContext = function () {
+    const context = this._context;
+    const origEnsure = context._ensureBrowserContext.bind(context);
+    context._ensureBrowserContext = function () {
       const promise = origEnsure();
       promise.then(({ browserContext }) => {
         const browser = browserContext.browser();
         if (browser && !browser._mcpDisconnectHooked) {
           browser._mcpDisconnectHooked = true;
           browser.on('disconnected', () => {
-            self._context._browserContextPromise = undefined;
-            self._context._browserContext = undefined;
+            context._browserContextPromise = undefined;
+            context._browserContext = undefined;
           });
         }
       }).catch(() => {});
