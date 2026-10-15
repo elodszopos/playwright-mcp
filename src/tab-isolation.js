@@ -168,12 +168,56 @@ function createTabAwareTools(config) {
   }).filter(Boolean);
 }
 
+function registerTab(tab, page) {
+  const tabId = generateTabId();
+
+  tabRegistry.set(tabId, {
+    page,
+    tab,
+    createdAt: new Date(),
+    title: 'New Tab'
+  });
+
+  if (typeof page.on === 'function') {
+    page.on('close', () => {
+      const currentEntry = tabRegistry.get(tabId);
+      if (currentEntry && currentEntry.page === page) {
+        tabRegistry.delete(tabId);
+      }
+    });
+
+    page.on('load', async () => {
+      const entry = tabRegistry.get(tabId);
+      if (entry) {
+        try {
+          entry.title = await page.title() || 'Untitled';
+        } catch (e) { /* page might be closed */ }
+      }
+    });
+  }
+
+  return tabId;
+}
+
+// Gives a tabId to every page opened outside browser_tabs "new": by hand, or as a popup.
+function adoptTabs(context) {
+  const adopted = new Set();
+  const registeredPages = new Set([...tabRegistry.values()].map(entry => entry.page));
+  for (const tab of context.tabs()) {
+    const page = tab.page || tab;
+    if (!registeredPages.has(page)) {
+      adopted.add(registerTab(tab, page));
+    }
+  }
+  return adopted;
+}
+
 function createTabsTool() {
   return {
     schema: {
       name: 'browser_tabs',
       title: 'Manage tabs',
-      description: 'Create, close, or list browser tabs. Use action="new" to create a tab and get your tabId (6-char string). Use action="close" with your tabId to close it. Use action="list" to see all tabs with their IDs and titles.',
+      description: 'Create, close, or list browser tabs. Use action="new" to create a tab and get your tabId (6-char string). Use action="close" with your tabId to close it. Use action="list" to see every tab with its ID and title; list also gives an ID to tabs opened by hand or as a popup.',
       inputSchema: z.object({
         action: z.enum(['new', 'close', 'list']).describe('Operation: "new" to create tab, "close" to close tab, "list" to see all tabs'),
         tabId: z.string().length(6).optional().describe('Tab ID (6-char string) to close (required for close action)')
@@ -185,34 +229,7 @@ function createTabsTool() {
       switch (params.action) {
         case 'new': {
           const { tab, page } = await createBackgroundTab(context);
-          const tabId = generateTabId();
-
-          tabRegistry.set(tabId, {
-            page,
-            tab,
-            createdAt: new Date(),
-            title: 'New Tab'
-          });
-
-          const pageRef = page;
-          const thisTabId = tabId;
-          if (typeof page.on === 'function') {
-            page.on('close', () => {
-              const currentEntry = tabRegistry.get(thisTabId);
-              if (currentEntry && currentEntry.page === pageRef) {
-                tabRegistry.delete(thisTabId);
-              }
-            });
-          }
-
-          page.on('load', async () => {
-            const entry = tabRegistry.get(tabId);
-            if (entry) {
-              try {
-                entry.title = await page.title() || 'Untitled';
-              } catch (e) { /* page might be closed */ }
-            }
-          });
+          const tabId = registerTab(tab, page);
 
           response.addResult(
             `## Tab Created\n\n` +
@@ -253,6 +270,7 @@ function createTabsTool() {
         }
 
         case 'list': {
+          const adopted = adoptTabs(context);
           const tabs = context.tabs();
           const tabList = [];
 
@@ -276,7 +294,7 @@ function createTabsTool() {
               }
             } catch (e) { /* keep defaults */ }
 
-            tabList.push({ id, title, url, createdAt: entry.createdAt.toISOString() });
+            tabList.push({ id, title: adopted.has(id) ? `(adopted) ${title}` : title, url, createdAt: entry.createdAt.toISOString() });
           }
 
           if (tabList.length === 0) {

@@ -35,7 +35,7 @@ All browser tools **require** a `tabId` parameter (6-character string). This pre
 |--------|-------------|
 | `new` | Create a new tab, returns 6-char `tabId` |
 | `close` | Close a tab (requires `tabId`) |
-| `list` | List all tabs with their IDs, titles, and URLs |
+| `list` | List every tab with its ID, title and URL. A tab opened by hand or as a popup gets its ID here |
 
 ### Tools Requiring tabId
 
